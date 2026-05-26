@@ -6,21 +6,18 @@ import requests
 from dotenv import load_dotenv
 from functools import wraps
 
-# Загружаем переменные из .env
 load_dotenv()
-
 app = Flask(__name__)
 
 # --- КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ ---
 RESEND_API_KEY = os.getenv('RESEND_API_KEY')
-# ТОТ ЖЕ КЛЮЧ, ЧТО В ПРИЛОЖЕНИИ
+TURNSTILE_SECRET_KEY = os.getenv('TURNSTILE_SECRET_KEY')  # Секретный ключ из Cloudflare
 APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0" 
 
-# История запросов для защиты от спама: { ip: [timestamps] }
 request_history = {}
+email_history = {}  # История запросов по Email: { email: [timestamps] }
 
 def make_json_response(data, status_code):
-    """Вспомогательная функция для генерации четкого JSON-ответа с заголовками для Cloudflare"""
     response = jsonify(data)
     response.headers["Content-Type"] = "application/json; charset=utf-8"
     return response, status_code
@@ -31,15 +28,13 @@ def limit_requests(f):
         ip = request.remote_addr
         now = time.time()
         
-        # Очищаем старые записи (старше 2 минут)
         if ip in request_history:
             request_history[ip] = [t for t in request_history[ip] if now - t < 120]
         else:
             request_history[ip] = []
             
-        # Лимит: не более 3 запросов за 2 минуты с одного IP
         if len(request_history[ip]) >= 3:
-            print(f">>> RATE LIMIT: Блокировка запроса от {ip}")
+            print(f">>> RATE LIMIT: Блокировка запроса по IP от {ip}")
             return make_json_response({"message": "Слишком много запросов. Подождите 2 минуты."}, 429)
             
         request_history[ip].append(now)
@@ -49,14 +44,12 @@ def limit_requests(f):
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # Проверяем секретный заголовок из Android приложения
         if request.headers.get('X-Spark-Auth') != APP_SECRET:
             print(f">>> AUTH ERROR: Неверный ключ доступа от {request.remote_addr}")
             return make_json_response({"message": "Access Denied"}, 401)
         return f(*args, **kwargs)
     return decorated_function
 
-# Временное хранилище кодов (email: {code, expires})
 verification_codes = {}
 
 @app.route('/send-verification-code', methods=['POST'])
@@ -69,15 +62,45 @@ def send_verification_code():
             return make_json_response({"message": "Пустой JSON запрос"}, 400)
             
         email = data.get('email')
+        captcha_token = data.get('captcha_token')
         
         if not email:
             return make_json_response({"message": "Email не указан"}, 400)
+            
+        if not captcha_token:
+            print(f">>> CAPTCHA ERROR: Токен капчи отсутствует для {email}")
+            return make_json_response({"message": "Капча не пройдена"}, 403)
 
-        # Генерация 4-значного кода
-        code = str(random.randint(1000, 9999))
+        # 1. ПРОВЕРКА КАПЧИ В CLOUDFLARE TURNSTILE
+        turnstile_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+        turnstile_resp = requests.post(turnstile_url, data={
+            "secret": TURNSTILE_SECRET_KEY,
+            "response": captcha_token,
+            "remoteip": request.remote_addr
+        })
+        turnstile_result = turnstile_resp.json()
         
-        # Срок действия 10 минут
-        expires_at = int(time.time()) + 600
+        if not turnstile_result.get("success"):
+            print(f">>> CAPTCHA FAILED: Невалидный токен капчи для {email}. Ответ: {turnstile_result}")
+            return make_json_response({"message": "Капча не пройдена"}, 403)
+
+        # 2. ПРОВЕРКА ЛИМИТОВ ПО EMAIL (Максимум 2 отправки за 15 минут)
+        now = int(time.time())
+        if email in email_history:
+            # Очищаем записи старше 15 минут (900 секунд)
+            email_history[email] = [t for t in email_history[email] if now - t < 900]
+        else:
+            email_history[email] = []
+            
+        if len(email_history[email]) >= 2:
+            print(f">>> EMAIL RATE LIMIT: Блокировка отправки на {email} (2 запроса за 15 минут)")
+            return make_json_response({"message": "Превышен лимит отправки кодов на этот Email"}, 429)
+
+        # Если все проверки успешны — фиксируем попытку отправки
+        email_history[email].append(now)
+
+        code = str(random.randint(1000, 9999))
+        expires_at = now + 600
         verification_codes[email] = {"code": code, "expires_at": expires_at}
 
         print(f"\n>>> ОТПРАВКА КОДА: {email}")
@@ -87,7 +110,6 @@ def send_verification_code():
             "Content-Type": "application/json"
         }
 
-        # Красивое и строгое письмо
         html_content = f"""
         <!DOCTYPE html>
         <html>
