@@ -1,6 +1,7 @@
 import os
 import random
 import time
+import threading  # Добавили для асинхронности
 from flask import Flask, request, jsonify
 import requests
 from dotenv import load_dotenv
@@ -16,6 +17,7 @@ APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0"
 
 request_history = {}
 email_history = {}  # История запросов по Email: { email: [timestamps] }
+verification_codes = {}
 
 def make_json_response(data, status_code):
     response = jsonify(data)
@@ -50,7 +52,19 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated_function
 
-verification_codes = {}
+# --- АСИНХРОННАЯ ФУНКЦИЯ ОТПРАВКИ ПИСЬМА ---
+def send_email_async(email, code, headers, payload):
+    """Выполняется параллельно и не блокирует основной поток Flask"""
+    try:
+        print(f">>> [ФОН] Начинается отправка письма на {email}...")
+        resend_resp = requests.post("https://api.resend.com/emails", headers=headers, json=payload, timeout=10)
+        
+        if resend_resp.status_code in [200, 201, 202]:
+            print(f">>> [ФОН] УСПЕШНО: Письмо для {email} отправлено.")
+        else:
+            print(f">>> [ФОН] ОШИБКА RESEND ДЛЯ {email}: {resend_resp.text}")
+    except Exception as e:
+        print(f">>> [ФОН] КРИТИЧЕСКАЯ ОШИБКА ПОТОКА ОТПРАВКИ: {str(e)}")
 
 @app.route('/send-verification-code', methods=['POST'])
 @require_auth
@@ -77,7 +91,7 @@ def send_verification_code():
             "secret": TURNSTILE_SECRET_KEY,
             "response": captcha_token,
             "remoteip": request.remote_addr
-        })
+        }, timeout=5)
         turnstile_result = turnstile_resp.json()
         
         if not turnstile_result.get("success"):
@@ -87,7 +101,6 @@ def send_verification_code():
         # 2. ПРОВЕРКА ЛИМИТОВ ПО EMAIL (Максимум 2 отправки за 15 минут)
         now = int(time.time())
         if email in email_history:
-            # Очищаем записи старше 15 минут (900 секунд)
             email_history[email] = [t for t in email_history[email] if now - t < 900]
         else:
             email_history[email] = []
@@ -96,14 +109,15 @@ def send_verification_code():
             print(f">>> EMAIL RATE LIMIT: Блокировка отправки на {email} (2 запроса за 15 минут)")
             return make_json_response({"message": "Превышен лимит отправки кодов на этот Email"}, 429)
 
-        # Если все проверки успешны — фиксируем попытку отправки
+        # Фиксируем попытку отправки
         email_history[email].append(now)
 
+        # Генерация и сохранение кода подтверждения
         code = str(random.randint(1000, 9999))
         expires_at = now + 600
         verification_codes[email] = {"code": code, "expires_at": expires_at}
 
-        print(f"\n>>> ОТПРАВКА КОДА: {email}")
+        print(f"\n>>> ИНИЦИАЛИЗАЦИЯ ОТПРАВКИ: {email} (Код: {code})")
         
         headers = {
             "Authorization": f"Bearer {RESEND_API_KEY}",
@@ -146,18 +160,19 @@ def send_verification_code():
             "html": html_content
         }
 
-        resend_resp = requests.post("https://api.resend.com/emails", headers=headers, json=payload)
-        
-        if resend_resp.status_code in [200, 201, 202]:
-            print(f">>> УСПЕШНО: Письмо отправлено.")
-            return make_json_response({"message": "Code sent"}, 200)
-        else:
-            print(f">>> ОШИБКА RESEND: {resend_resp.text}")
-            return make_json_response({"message": "Resend Error", "details": resend_resp.text}, resend_resp.status_code)
+        # ЗАПУСК ФОНОВОГО ПОТОКА ДЛЯ RESEND
+        email_thread = threading.Thread(
+            target=send_email_async, 
+            args=(email, code, headers, payload)
+        )
+        email_thread.start()
+
+        # МГНОВЕННЫЙ ОТВЕТ КЛИЕНТУ (пока поток шлёт письмо)
+        return make_json_response({"message": "Code sent"}, 200)
 
     except Exception as e:
         print(f">>> ОШИБКА СЕРВЕРА: {str(e)}")
         return make_json_response({"message": "Server Error", "error": str(e)}, 500)
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000)
+    app.run(host='0.0.0.0', port=5000)
