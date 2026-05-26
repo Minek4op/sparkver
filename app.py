@@ -138,5 +138,4 @@ def send_verification_code():
         return make_json_response({"message": "Server Error", "error": str(e)}, 500)
 
 if __name__ == '__main__':
-    # Слушаем на всех интерфейсах (0.0.0.0) и порту 8443, куда проксирует Cloudflare
-    app.run(host='0.0.0.0', port=8443)
+    app.run(host='0.0.0.0', port=80)
