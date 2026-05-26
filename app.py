@@ -19,6 +19,12 @@ APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0"
 # История запросов для защиты от спама: { ip: [timestamps] }
 request_history = {}
 
+def make_json_response(data, status_code):
+    """Вспомогательная функция для генерации четкого JSON-ответа с заголовками для Cloudflare"""
+    response = jsonify(data)
+    response.headers["Content-Type"] = "application/json; charset=utf-8"
+    return response, status_code
+
 def limit_requests(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -34,7 +40,7 @@ def limit_requests(f):
         # Лимит: не более 3 запросов за 2 минуты с одного IP
         if len(request_history[ip]) >= 3:
             print(f">>> RATE LIMIT: Блокировка запроса от {ip}")
-            return jsonify({"message": "Слишком много запросов. Подождите 2 минуты."}), 429
+            return make_json_response({"message": "Слишком много запросов. Подождите 2 минуты."}, 429)
             
         request_history[ip].append(now)
         return f(*args, **kwargs)
@@ -46,7 +52,7 @@ def require_auth(f):
         # Проверяем секретный заголовок из Android приложения
         if request.headers.get('X-Spark-Auth') != APP_SECRET:
             print(f">>> AUTH ERROR: Неверный ключ доступа от {request.remote_addr}")
-            return jsonify({"message": "Access Denied"}), 401
+            return make_json_response({"message": "Access Denied"}, 401)
         return f(*args, **kwargs)
     return decorated_function
 
@@ -59,10 +65,13 @@ verification_codes = {}
 def send_verification_code():
     try:
         data = request.get_json()
+        if not data:
+            return make_json_response({"message": "Пустой JSON запрос"}, 400)
+            
         email = data.get('email')
         
         if not email:
-            return jsonify({"message": "Email не указан"}), 400
+            return make_json_response({"message": "Email не указан"}, 400)
 
         # Генерация 4-значного кода
         code = str(random.randint(1000, 9999))
@@ -119,15 +128,15 @@ def send_verification_code():
         
         if resend_resp.status_code in [200, 201, 202]:
             print(f">>> УСПЕШНО: Письмо отправлено.")
-            return jsonify({"message": "Code sent"}), 200
+            return make_json_response({"message": "Code sent"}, 200)
         else:
             print(f">>> ОШИБКА RESEND: {resend_resp.text}")
-            return jsonify({"message": "Resend Error", "details": resend_resp.text}), resend_resp.status_code
+            return make_json_response({"message": "Resend Error", "details": resend_resp.text}, resend_resp.status_code)
 
     except Exception as e:
         print(f">>> ОШИБКА СЕРВЕРА: {str(e)}")
-        return jsonify({"message": "Server Error", "error": str(e)}), 500
+        return make_json_response({"message": "Server Error", "error": str(e)}, 500)
 
 if __name__ == '__main__':
-    # Слушаем только локально, Nginx прокидывает запросы через HTTPS
-    app.run(host='127.0.0.1', port=5000)
+    # Слушаем на всех интерфейсах (0.0.0.0) и порту 8443, куда проксирует Cloudflare
+    app.run(host='0.0.0.0', port=8443)
