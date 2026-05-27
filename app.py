@@ -1,7 +1,7 @@
 import os
 import random
 import time
-import threading  # Добавили для асинхронности
+import threading  # Для асинхронности
 from flask import Flask, request, jsonify
 import requests
 from dotenv import load_dotenv
@@ -17,7 +17,7 @@ APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0"
 
 request_history = {}
 email_history = {}  # История запросов по Email: { email: [timestamps] }
-verification_codes = {}
+verification_codes = {} # Хранилище кодов: { email: {"code": "1234", "expires_at": 169...} }
 
 def make_json_response(data, status_code):
     response = jsonify(data)
@@ -66,6 +66,9 @@ def send_email_async(email, code, headers, payload):
     except Exception as e:
         print(f">>> [ФОН] КРИТИЧЕСКАЯ ОШИБКА ПОТОКА ОТПРАВКИ: {str(e)}")
 
+# =====================================================================
+# ЭНДПОИНТ 1: ОТПРАВКА КОДА
+# =====================================================================
 @app.route('/send-verification-code', methods=['POST'])
 @require_auth
 @limit_requests
@@ -98,7 +101,7 @@ def send_verification_code():
             print(f">>> CAPTCHA FAILED: Невалидный токен капчи для {email}. Ответ: {turnstile_result}")
             return make_json_response({"message": "Капча не пройдена"}, 403)
 
-        # 2. ПРОВЕРКА ЛИМИТОВ ПО EMAIL (Максимум 2 отправки за 15 минут)
+        # 2. ПРОВЕРКА ЛИМИТОВ ПО EMAIL
         now = int(time.time())
         if email in email_history:
             email_history[email] = [t for t in email_history[email] if now - t < 900]
@@ -106,15 +109,14 @@ def send_verification_code():
             email_history[email] = []
             
         if len(email_history[email]) >= 2:
-            print(f">>> EMAIL RATE LIMIT: Блокировка отправки на {email} (2 запроса за 15 минут)")
-            return make_json_response({"message": "Превышен лимит отправки кодов на этот Email"}, 429)
+            print(f">>> EMAIL RATE LIMIT: Блокировка отправки на {email}")
+            return make_json_response({"message": "Превышен лимит отправки кодов"}, 429)
 
-        # Фиксируем попытку отправки
         email_history[email].append(now)
 
-        # Генерация и сохранение кода подтверждения
+        # 3. ГЕНЕРАЦИЯ И СОХРАНЕНИЕ КОДА
         code = str(random.randint(1000, 9999))
-        expires_at = now + 600
+        expires_at = now + 600 # 10 минут
         verification_codes[email] = {"code": code, "expires_at": expires_at}
 
         print(f"\n>>> ИНИЦИАЛИЗАЦИЯ ОТПРАВКИ: {email} (Код: {code})")
@@ -167,11 +169,56 @@ def send_verification_code():
         )
         email_thread.start()
 
-        # МГНОВЕННЫЙ ОТВЕТ КЛИЕНТУ (пока поток шлёт письмо)
         return make_json_response({"message": "Code sent"}, 200)
 
     except Exception as e:
         print(f">>> ОШИБКА СЕРВЕРА: {str(e)}")
+        return make_json_response({"message": "Server Error", "error": str(e)}, 500)
+
+# =====================================================================
+# ЭНДПОИНТ 2: ПРОВЕРКА КОДА (НОВЫЙ)
+# =====================================================================
+@app.route('/verify-code', methods=['POST'])
+@require_auth
+def verify_code():
+    try:
+        data = request.get_json()
+        if not data:
+            return make_json_response({"message": "Пустой JSON запрос"}, 400)
+            
+        email = data.get('email')
+        code = data.get('code')
+        
+        if not email or not code:
+            return make_json_response({"message": "Email или код не указаны"}, 400)
+
+        # 1. Проверяем, запрашивался ли код для этого email
+        if email not in verification_codes:
+            print(f">>> VERIFY ERROR: Код для {email} не найден")
+            return make_json_response({"message": "Код не найден или устарел"}, 404)
+
+        record = verification_codes[email]
+        now = int(time.time())
+
+        # 2. Проверяем срок годности кода (10 минут)
+        if now > record["expires_at"]:
+            del verification_codes[email]
+            print(f">>> VERIFY ERROR: Время кода для {email} истекло")
+            return make_json_response({"message": "Время действия кода истекло"}, 400)
+
+        # 3. Сверяем сам код
+        if record["code"] != code:
+            print(f">>> VERIFY ERROR: Неверный код для {email}")
+            return make_json_response({"message": "Неверный код"}, 400)
+
+        # 4. Код верный!
+        print(f">>> УСПЕШНАЯ АВТОРИЗАЦИЯ: {email}")
+        del verification_codes[email] # Удаляем, чтобы не зашли второй раз по старому коду
+        
+        return make_json_response({"message": "Код верный"}, 200)
+
+    except Exception as e:
+        print(f">>> ОШИБКА СЕРВЕРА (verify): {str(e)}")
         return make_json_response({"message": "Server Error", "error": str(e)}, 500)
 
 if __name__ == '__main__':
