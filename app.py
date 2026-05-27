@@ -1,7 +1,7 @@
 import os
 import random
 import time
-import threading  # Добавили для асинхронности
+import threading
 from flask import Flask, request, jsonify
 import requests
 from dotenv import load_dotenv
@@ -12,11 +12,11 @@ app = Flask(__name__)
 
 # --- КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ ---
 RESEND_API_KEY = os.getenv('RESEND_API_KEY')
-TURNSTILE_SECRET_KEY = os.getenv('TURNSTILE_SECRET_KEY')  # Секретный ключ из Cloudflare
+TURNSTILE_SECRET_KEY = os.getenv('TURNSTILE_SECRET_KEY')
 APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0" 
 
 request_history = {}
-email_history = {}  # История запросов по Email: { email: [timestamps] }
+email_history = {}
 verification_codes = {}
 
 def make_json_response(data, status_code):
@@ -54,7 +54,6 @@ def require_auth(f):
 
 # --- АСИНХРОННАЯ ФУНКЦИЯ ОТПРАВКИ ПИСЬМА ---
 def send_email_async(email, code, headers, payload):
-    """Выполняется параллельно и не блокирует основной поток Flask"""
     try:
         print(f">>> [ФОН] Начинается отправка письма на {email}...")
         resend_resp = requests.post("https://api.resend.com/emails", headers=headers, json=payload, timeout=10)
@@ -99,7 +98,7 @@ def send_verification_code():
             return make_json_response({"message": "Капча не пройдена"}, 403)
 
         # 2. ПРОВЕРКА ЛИМИТОВ ПО EMAIL (Максимум 2 отправки за 15 минут)
-        now = time.time()  # Изменено на float для корректного сравнения с историей
+        now = time.time()
         if email in email_history:
             email_history[email] = [t for t in email_history[email] if now - t < 900]
         else:
@@ -167,7 +166,6 @@ def send_verification_code():
         )
         email_thread.start()
 
-        # МГНОВЕННЫЙ ОТВЕТ КЛИЕНТУ (пока поток шлёт письмо)
         return make_json_response({"message": "Code sent"}, 200)
 
     except Exception as e:
