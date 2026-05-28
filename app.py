@@ -17,9 +17,10 @@ RESEND_API_KEY = os.getenv('RESEND_API_KEY')
 TURNSTILE_SECRET_KEY = os.getenv('TURNSTILE_SECRET_KEY')
 APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0" 
 
-# Словари для лимитов пока оставляем в памяти, для базовой защиты этого хватит
+# Словари для защиты от спама
 request_history = {}
 email_history = {}
+blocked_emails = {} # НОВОЕ: Жесткая блокировка почты {email: timestamp_разблокировки}
 
 # =====================================================================
 # НАСТРОЙКА БАЗЫ ДАННЫХ SQLITE
@@ -77,7 +78,7 @@ def limit_requests(f):
         else:
             request_history[ip] = []
             
-        if len(request_history[ip]) >= 3:
+        if len(request_history[ip]) >= 5: # Лимит по IP немного увеличен, чтобы не блокировать нормальных юзеров
             print(f">>> RATE LIMIT: Блокировка запроса по IP от {ip}")
             return make_json_response({"message": "Слишком много запросов. Подождите 2 минуты."}, 429)
             
@@ -124,11 +125,25 @@ def send_verification_code():
         
         if not email:
             return make_json_response({"message": "Email не указан"}, 400)
+
+        now = int(time.time())
+
+        # 1. ЖЕСТКАЯ ПРОВЕРКА НА БЛОКИРОВКУ ПОЧТЫ (НОВОЕ)
+        if email in blocked_emails:
+            if now < blocked_emails[email]:
+                remaining_seconds = blocked_emails[email] - now
+                print(f">>> EMAIL BLOCKED: Попытка отправки на заблокированную почту {email}. Осталось {remaining_seconds} сек.")
+                return make_json_response({"message": "Превышен лимит отправки кодов"}, 429)
+            else:
+                # Время блокировки вышло, удаляем из черного списка
+                del blocked_emails[email]
+                email_history[email] = []
+
         if not captcha_token:
             print(f">>> CAPTCHA ERROR: Токен капчи отсутствует для {email}")
             return make_json_response({"message": "Капча не пройдена"}, 403)
 
-        # 1. ПРОВЕРКА КАПЧИ В CLOUDFLARE TURNSTILE
+        # 2. ПРОВЕРКА КАПЧИ В CLOUDFLARE TURNSTILE
         turnstile_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
         turnstile_resp = requests.post(turnstile_url, data={
             "secret": TURNSTILE_SECRET_KEY,
@@ -141,20 +156,20 @@ def send_verification_code():
             print(f">>> CAPTCHA FAILED: Невалидный токен капчи для {email}. Ответ: {turnstile_result}")
             return make_json_response({"message": "Капча не пройдена"}, 403)
 
-        # 2. ПРОВЕРКА ЛИМИТОВ ПО EMAIL
-        now = int(time.time())
+        # 3. ПОДСЧЕТ ОТПРАВОК И ВЫДАЧА БЛОКИРОВКИ НА 15 МИНУТ
         if email in email_history:
             email_history[email] = [t for t in email_history[email] if now - t < 900]
         else:
             email_history[email] = []
             
-        if len(email_history[email]) >= 2:
-            print(f">>> EMAIL RATE LIMIT: Блокировка отправки на {email}")
+        if len(email_history[email]) >= 2: # Если запрашивает 3-й раз за 15 минут
+            blocked_emails[email] = now + 900 # Строгая блокировка на 15 минут от текущей секунды
+            print(f">>> EMAIL RATE LIMIT: Превышен лимит! Почта {email} ЖЕСТКО заблокирована на 15 минут.")
             return make_json_response({"message": "Превышен лимит отправки кодов"}, 429)
 
         email_history[email].append(now)
 
-        # 3. ГЕНЕРАЦИЯ И ЗАПИСЬ КОДА В БАЗУ ДАННЫХ
+        # 4. ГЕНЕРАЦИЯ И ЗАПИСЬ КОДА В БАЗУ ДАННЫХ
         code = str(random.randint(1000, 9999))
         expires_at = now + 600 # 10 минут
         
@@ -284,6 +299,12 @@ def verify_code():
         
         conn.commit()
         conn.close()
+        
+        # При успешном входе сбрасываем историю блокировок для этой почты
+        if email in email_history:
+            del email_history[email]
+        if email in blocked_emails:
+            del blocked_emails[email]
         
         return make_json_response({
             "message": "Код верный",
