@@ -2,8 +2,8 @@ import os
 import random
 import time
 import threading
-import sqlite3 # === НОВОЕ: Встроенная база данных ===
-import secrets # === НОВОЕ: Для генерации надежного токена сессии ===
+import sqlite3
+import secrets
 from flask import Flask, request, jsonify
 import requests
 from dotenv import load_dotenv
@@ -26,9 +26,9 @@ email_history = {}
 # =====================================================================
 def get_db_connection():
     # Подключаемся к файлу (если его нет, он создастся автоматически)
-    # timeout=10 нужен, чтобы 4 воркера не блокировали друг друга при записи
+    # timeout=10 нужен, чтобы 4 воркера Gunicorn не блокировали друг друга при записи
     conn = sqlite3.connect('spark_messenger.db', timeout=10)
-    conn.row_factory = sqlite3.Row # Чтобы обращаться к колонкам по именам
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
@@ -71,13 +71,16 @@ def limit_requests(f):
     def decorated_function(*args, **kwargs):
         ip = request.remote_addr
         now = time.time()
+        
         if ip in request_history:
             request_history[ip] = [t for t in request_history[ip] if now - t < 120]
         else:
             request_history[ip] = []
+            
         if len(request_history[ip]) >= 3:
             print(f">>> RATE LIMIT: Блокировка запроса по IP от {ip}")
             return make_json_response({"message": "Слишком много запросов. Подождите 2 минуты."}, 429)
+            
         request_history[ip].append(now)
         return f(*args, **kwargs)
     return decorated_function
@@ -95,12 +98,14 @@ def send_email_async(email, code, headers, payload):
     try:
         print(f">>> [ФОН] Начинается отправка письма на {email}...")
         resend_resp = requests.post("https://api.resend.com/emails", headers=headers, json=payload, timeout=10)
+        
         if resend_resp.status_code in [200, 201, 202]:
             print(f">>> [ФОН] УСПЕШНО: Письмо для {email} отправлено.")
         else:
             print(f">>> [ФОН] ОШИБКА RESEND ДЛЯ {email}: {resend_resp.text}")
     except Exception as e:
         print(f">>> [ФОН] КРИТИЧЕСКАЯ ОШИБКА ПОТОКА ОТПРАВКИ: {str(e)}")
+
 
 # =====================================================================
 # ЭНДПОИНТ 1: ОТПРАВКА КОДА
@@ -153,7 +158,6 @@ def send_verification_code():
         code = str(random.randint(1000, 9999))
         expires_at = now + 600 # 10 минут
         
-        # Открываем соединение, записываем код (или обновляем, если он уже был)
         conn = get_db_connection()
         conn.execute('''
             INSERT INTO verification_codes (email, code, expires_at)
@@ -263,7 +267,7 @@ def verify_code():
             print(f">>> VERIFY ERROR: Неверный код для {email}")
             return make_json_response({"message": "Неверный код"}, 400)
 
-        # 4. КОД ВЕРНЫЙ! Генерируем сложный токен (защита от прокси-хакеров)
+        # 4. КОД ВЕРНЫЙ! Генерируем сложный токен
         print(f">>> УСПЕШНАЯ АВТОРИЗАЦИЯ: {email}")
         
         # Генерируем 64-символьную случайную строку
@@ -281,15 +285,42 @@ def verify_code():
         conn.commit()
         conn.close()
         
-        # Возвращаем приложению сообщение об успехе И ТОКЕН СЕССИИ!
         return make_json_response({
             "message": "Код верный",
-            "token": auth_token  # <--- Андроид должен сохранить его в SharedPreferences!
+            "token": auth_token
         }, 200)
 
     except Exception as e:
         print(f">>> ОШИБКА СЕРВЕРА (verify): {str(e)}")
         return make_json_response({"message": "Server Error", "error": str(e)}, 500)
+
+
+# =====================================================================
+# ЭНДПОИНТ 3: АННУЛИРОВАНИЕ КОДА (ПРИ НАЖАТИИ "НАЗАД")
+# =====================================================================
+@app.route('/invalidate-code', methods=['POST'])
+@require_auth
+def invalidate_code():
+    try:
+        data = request.get_json()
+        if not data:
+            return make_json_response({"message": "Пустой JSON запрос"}, 400)
+            
+        email = data.get('email')
+        
+        if email:
+            conn = get_db_connection()
+            conn.execute('DELETE FROM verification_codes WHERE email = ?', (email,))
+            conn.commit()
+            conn.close()
+            print(f">>> КОД АННУЛИРОВАН: Пользователь {email} вышел с экрана верификации")
+            
+        return make_json_response({"message": "OK"}, 200)
+        
+    except Exception as e:
+        print(f">>> ОШИБКА СЕРВЕРА (invalidate): {str(e)}")
+        return make_json_response({"message": "Server Error", "error": str(e)}, 500)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
