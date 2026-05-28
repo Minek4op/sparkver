@@ -49,7 +49,7 @@ def init_db():
         )
     ''')
 
-    # --- НОВЫЕ ТАБЛИЦЫ ДЛЯ ЖЕСТКОЙ ЗАЩИТЫ ОТ СПАМА ---
+    # --- ТАБЛИЦЫ ДЛЯ ЖЕСТКОЙ ЗАЩИТЫ ОТ СПАМА ---
     conn.execute('''
         CREATE TABLE IF NOT EXISTS rate_limits (
             email TEXT,
@@ -68,6 +68,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ip_rate_limits (
             ip TEXT,
             timestamp INTEGER
+        )
+    ''')
+
+    # --- НОВОЕ: ТАБЛИЦА ДЛЯ БЛОКИРОВКИ ПОДБОРА КОДА (BRUTE FORCE) ---
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_attempts (
+            email TEXT PRIMARY KEY,
+            attempt_count INTEGER DEFAULT 0,
+            blocked_until INTEGER DEFAULT 0
         )
     ''')
     
@@ -96,6 +105,7 @@ def limit_requests(f):
             conn.execute('DELETE FROM ip_rate_limits WHERE timestamp <= ?', (now - 120,))
             conn.execute('DELETE FROM rate_limits WHERE timestamp <= ?', (now - 900,))
             conn.execute('DELETE FROM blocked_emails WHERE blocked_until <= ?', (now,))
+            conn.execute('DELETE FROM blocked_attempts WHERE blocked_until > 0 AND blocked_until <= ?', (now,))
             conn.commit()
             
         recent_reqs = conn.execute('SELECT COUNT(*) as count FROM ip_rate_limits WHERE ip = ? AND timestamp > ?', (ip, now - 120)).fetchone()['count']
@@ -192,7 +202,7 @@ def send_verification_code():
         conn = get_db_connection()
         recent_attempts = conn.execute('SELECT COUNT(*) as count FROM rate_limits WHERE email = ? AND timestamp > ?', (email, now - 900)).fetchone()['count']
             
-        if recent_attempts >= 1: # Если запрашивает 3-й раз за 15 минут
+        if recent_attempts >= 1: # Если запрашивает 2-й раз за 15 минут
             conn.execute('''
                 INSERT INTO blocked_emails (email, blocked_until)
                 VALUES (?, ?)
@@ -203,7 +213,7 @@ def send_verification_code():
             print(f">>> EMAIL RATE LIMIT: Превышен лимит! Почта {email} ЖЕСТКО заблокирована на 15 минут.")
             return make_json_response({"message": "Превышен лимит отправки кодов"}, 429)
 
-        # Логируем текущую попытку
+        # Логируем текущую попытку отправки письма
         conn.execute('INSERT INTO rate_limits (email, timestamp) VALUES (?, ?)', (email, now))
 
         # 4. ГЕНЕРАЦИЯ И ЗАПИСЬ КОДА В БАЗУ ДАННЫХ
@@ -216,6 +226,10 @@ def send_verification_code():
             ON CONFLICT(email) DO UPDATE SET
             code=excluded.code, expires_at=excluded.expires_at
         ''', (email, code, expires_at))
+        
+        # Сбрасываем неверные попытки ввода при отправке нового кода
+        conn.execute('DELETE FROM blocked_attempts WHERE email = ?', (email,))
+        
         conn.commit()
         conn.close()
 
@@ -292,9 +306,19 @@ def verify_code():
         if not email or not code:
             return make_json_response({"message": "Email или код не указаны"}, 400)
 
+        now = int(time.time())
         conn = get_db_connection()
         
-        # 1. Ищем код в БАЗЕ ДАННЫХ
+        # 1. ПРОВЕРКА БЛОКИРОВКИ ОТ BRUTE FORCE (НОВОЕ)
+        attempt_record = conn.execute('SELECT attempt_count, blocked_until FROM blocked_attempts WHERE email = ?', (email,)).fetchone()
+        
+        if attempt_record and attempt_record['blocked_until'] > now:
+            remaining = attempt_record['blocked_until'] - now
+            conn.close()
+            print(f">>> BRUTE FORCE BLOCK: Почта {email} заблокирована. Осталось {remaining} сек.")
+            return make_json_response({"message": "Слишком много неверных попыток. Доступ закрыт на 15 минут."}, 429)
+
+        # 2. Ищем код в БАЗЕ ДАННЫХ
         row = conn.execute('SELECT code, expires_at FROM verification_codes WHERE email = ?', (email,)).fetchone()
         
         if not row:
@@ -302,9 +326,7 @@ def verify_code():
             print(f">>> VERIFY ERROR: Код для {email} не найден")
             return make_json_response({"message": "Код не найден или устарел"}, 404)
 
-        now = int(time.time())
-
-        # 2. Проверяем срок годности
+        # 3. Проверяем срок годности
         if now > row["expires_at"]:
             conn.execute('DELETE FROM verification_codes WHERE email = ?', (email,))
             conn.commit()
@@ -312,19 +334,38 @@ def verify_code():
             print(f">>> VERIFY ERROR: Время кода для {email} истекло")
             return make_json_response({"message": "Время действия кода истекло"}, 400)
 
-        # 3. Сверяем сам код
+        # 4. Сверяем сам код (ОБРАБОТКА НЕВЕРНОГО КОДА)
         if row["code"] != code:
+            # Увеличиваем счетчик ошибок
+            new_count = (attempt_record['attempt_count'] + 1) if attempt_record else 1
+            blocked_until = (now + 900) if new_count >= 5 else 0 # Блок на 15 мин после 5 ошибок
+            
+            conn.execute('''
+                INSERT INTO blocked_attempts (email, attempt_count, blocked_until)
+                VALUES (?, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET 
+                attempt_count = excluded.attempt_count,
+                blocked_until = excluded.blocked_until
+            ''', (email, new_count, blocked_until))
+            conn.commit()
             conn.close()
-            print(f">>> VERIFY ERROR: Неверный код для {email}")
-            return make_json_response({"message": "Неверный код"}, 400)
+            
+            print(f">>> VERIFY ERROR: Неверный код для {email} (Попытка {new_count}/5)")
+            
+            if new_count >= 5:
+                return make_json_response({"message": "Слишком много неверных попыток. Доступ закрыт на 15 минут."}, 429)
+            else:
+                return make_json_response({"message": "Неверный код"}, 401)
 
-        # 4. КОД ВЕРНЫЙ! Генерируем сложный токен
+        # 5. КОД ВЕРНЫЙ! Генерируем сложный токен
         print(f">>> УСПЕШНАЯ АВТОРИЗАЦИЯ: {email}")
         
         auth_token = secrets.token_hex(32) 
         
-        # Удаляем использованный код и записываем/обновляем токен юзера
+        # Удаляем использованный код, сбрасываем попытки и записываем токен
         conn.execute('DELETE FROM verification_codes WHERE email = ?', (email,))
+        conn.execute('DELETE FROM blocked_attempts WHERE email = ?', (email,))
+        
         conn.execute('''
             INSERT INTO users (email, auth_token, created_at)
             VALUES (?, ?, ?)
@@ -332,7 +373,7 @@ def verify_code():
             auth_token=excluded.auth_token
         ''', (email, auth_token, now))
         
-        # Очищаем историю блокировок после успешного входа
+        # Очищаем историю блокировок писем после успешного входа
         conn.execute('DELETE FROM rate_limits WHERE email = ?', (email,))
         conn.execute('DELETE FROM blocked_emails WHERE email = ?', (email,))
         
