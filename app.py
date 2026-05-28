@@ -17,13 +17,8 @@ RESEND_API_KEY = os.getenv('RESEND_API_KEY')
 TURNSTILE_SECRET_KEY = os.getenv('TURNSTILE_SECRET_KEY')
 APP_SECRET = "Qx9zP2wL4mN7bV1sK5hJ8rT3yX6gZ0" 
 
-# Словари для защиты от спама
-request_history = {}
-email_history = {}
-blocked_emails = {} # НОВОЕ: Жесткая блокировка почты {email: timestamp_разблокировки}
-
 # =====================================================================
-# НАСТРОЙКА БАЗЫ ДАННЫХ SQLITE
+# НАСТРОЙКА БАЗЫ ДАННЫХ SQLITE (Теперь храним ВСЕ лимиты здесь)
 # =====================================================================
 def get_db_connection():
     # Подключаемся к файлу (если его нет, он создастся автоматически)
@@ -53,6 +48,28 @@ def init_db():
             created_at INTEGER
         )
     ''')
+
+    # --- НОВЫЕ ТАБЛИЦЫ ДЛЯ ЖЕСТКОЙ ЗАЩИТЫ ОТ СПАМА ---
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            email TEXT,
+            timestamp INTEGER
+        )
+    ''')
+    
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_emails (
+            email TEXT PRIMARY KEY,
+            blocked_until INTEGER
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS ip_rate_limits (
+            ip TEXT,
+            timestamp INTEGER
+        )
+    ''')
     
     conn.commit()
     conn.close()
@@ -71,18 +88,27 @@ def limit_requests(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         ip = request.remote_addr
-        now = time.time()
+        now = int(time.time())
+        conn = get_db_connection()
         
-        if ip in request_history:
-            request_history[ip] = [t for t in request_history[ip] if now - t < 120]
-        else:
-            request_history[ip] = []
+        # Легкая авто-очистка старых IP логов (срабатывает с шансом 5%, чтобы БД не разрасталась)
+        if random.random() < 0.05:
+            conn.execute('DELETE FROM ip_rate_limits WHERE timestamp <= ?', (now - 120,))
+            conn.execute('DELETE FROM rate_limits WHERE timestamp <= ?', (now - 900,))
+            conn.execute('DELETE FROM blocked_emails WHERE blocked_until <= ?', (now,))
+            conn.commit()
             
-        if len(request_history[ip]) >= 5: # Лимит по IP немного увеличен, чтобы не блокировать нормальных юзеров
+        recent_reqs = conn.execute('SELECT COUNT(*) as count FROM ip_rate_limits WHERE ip = ? AND timestamp > ?', (ip, now - 120)).fetchone()['count']
+        
+        if recent_reqs >= 5:
+            conn.close()
             print(f">>> RATE LIMIT: Блокировка запроса по IP от {ip}")
             return make_json_response({"message": "Слишком много запросов. Подождите 2 минуты."}, 429)
             
-        request_history[ip].append(now)
+        conn.execute('INSERT INTO ip_rate_limits (ip, timestamp) VALUES (?, ?)', (ip, now))
+        conn.commit()
+        conn.close()
+        
         return f(*args, **kwargs)
     return decorated_function
 
@@ -128,16 +154,22 @@ def send_verification_code():
 
         now = int(time.time())
 
-        # 1. ЖЕСТКАЯ ПРОВЕРКА НА БЛОКИРОВКУ ПОЧТЫ (НОВОЕ)
-        if email in blocked_emails:
-            if now < blocked_emails[email]:
-                remaining_seconds = blocked_emails[email] - now
+        # 1. ЖЕСТКАЯ ПРОВЕРКА НА БЛОКИРОВКУ ПОЧТЫ В БД
+        conn = get_db_connection()
+        block_record = conn.execute('SELECT blocked_until FROM blocked_emails WHERE email = ?', (email,)).fetchone()
+        
+        if block_record:
+            if now < block_record['blocked_until']:
+                remaining_seconds = block_record['blocked_until'] - now
                 print(f">>> EMAIL BLOCKED: Попытка отправки на заблокированную почту {email}. Осталось {remaining_seconds} сек.")
+                conn.close()
                 return make_json_response({"message": "Превышен лимит отправки кодов"}, 429)
             else:
                 # Время блокировки вышло, удаляем из черного списка
-                del blocked_emails[email]
-                email_history[email] = []
+                conn.execute('DELETE FROM blocked_emails WHERE email = ?', (email,))
+                conn.execute('DELETE FROM rate_limits WHERE email = ?', (email,))
+                conn.commit()
+        conn.close() # Закрываем перед долгим запросом к Turnstile
 
         if not captcha_token:
             print(f">>> CAPTCHA ERROR: Токен капчи отсутствует для {email}")
@@ -156,24 +188,28 @@ def send_verification_code():
             print(f">>> CAPTCHA FAILED: Невалидный токен капчи для {email}. Ответ: {turnstile_result}")
             return make_json_response({"message": "Капча не пройдена"}, 403)
 
-        # 3. ПОДСЧЕТ ОТПРАВОК И ВЫДАЧА БЛОКИРОВКИ НА 15 МИНУТ
-        if email in email_history:
-            email_history[email] = [t for t in email_history[email] if now - t < 900]
-        else:
-            email_history[email] = []
+        # 3. ПОДСЧЕТ ОТПРАВОК И ВЫДАЧА БЛОКИРОВКИ НА 15 МИНУТ ЧЕРЕЗ БД
+        conn = get_db_connection()
+        recent_attempts = conn.execute('SELECT COUNT(*) as count FROM rate_limits WHERE email = ? AND timestamp > ?', (email, now - 900)).fetchone()['count']
             
-        if len(email_history[email]) >= 2: # Если запрашивает 3-й раз за 15 минут
-            blocked_emails[email] = now + 900 # Строгая блокировка на 15 минут от текущей секунды
+        if recent_attempts >= 2: # Если запрашивает 3-й раз за 15 минут
+            conn.execute('''
+                INSERT INTO blocked_emails (email, blocked_until)
+                VALUES (?, ?)
+                ON CONFLICT(email) DO UPDATE SET blocked_until=excluded.blocked_until
+            ''', (email, now + 900)) # Строгая блокировка на 15 минут
+            conn.commit()
+            conn.close()
             print(f">>> EMAIL RATE LIMIT: Превышен лимит! Почта {email} ЖЕСТКО заблокирована на 15 минут.")
             return make_json_response({"message": "Превышен лимит отправки кодов"}, 429)
 
-        email_history[email].append(now)
+        # Логируем текущую попытку
+        conn.execute('INSERT INTO rate_limits (email, timestamp) VALUES (?, ?)', (email, now))
 
         # 4. ГЕНЕРАЦИЯ И ЗАПИСЬ КОДА В БАЗУ ДАННЫХ
         code = str(random.randint(1000, 9999))
         expires_at = now + 600 # 10 минут
         
-        conn = get_db_connection()
         conn.execute('''
             INSERT INTO verification_codes (email, code, expires_at)
             VALUES (?, ?, ?)
@@ -285,7 +321,6 @@ def verify_code():
         # 4. КОД ВЕРНЫЙ! Генерируем сложный токен
         print(f">>> УСПЕШНАЯ АВТОРИЗАЦИЯ: {email}")
         
-        # Генерируем 64-символьную случайную строку
         auth_token = secrets.token_hex(32) 
         
         # Удаляем использованный код и записываем/обновляем токен юзера
@@ -297,14 +332,12 @@ def verify_code():
             auth_token=excluded.auth_token
         ''', (email, auth_token, now))
         
+        # Очищаем историю блокировок после успешного входа
+        conn.execute('DELETE FROM rate_limits WHERE email = ?', (email,))
+        conn.execute('DELETE FROM blocked_emails WHERE email = ?', (email,))
+        
         conn.commit()
         conn.close()
-        
-        # При успешном входе сбрасываем историю блокировок для этой почты
-        if email in email_history:
-            del email_history[email]
-        if email in blocked_emails:
-            del blocked_emails[email]
         
         return make_json_response({
             "message": "Код верный",
