@@ -192,7 +192,7 @@ def send_verification_code():
         conn = get_db_connection()
         recent_attempts = conn.execute('SELECT COUNT(*) as count FROM rate_limits WHERE email = ? AND timestamp > ?', (email, now - 900)).fetchone()['count']
             
-        if recent_attempts >= 2: # Если запрашивает 3-й раз за 15 минут
+        if recent_attempts >= 1: # Если запрашивает 3-й раз за 15 минут
             conn.execute('''
                 INSERT INTO blocked_emails (email, blocked_until)
                 VALUES (?, ?)
