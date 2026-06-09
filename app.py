@@ -5,12 +5,17 @@ import threading
 import sqlite3
 import secrets
 from flask import Flask, request, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix  # <-- ИСПРАВЛЕНИЕ: Импортируем фикс прокси
 import requests
 from dotenv import load_dotenv
 from functools import wraps
 
 load_dotenv()
 app = Flask(__name__)
+
+# --- ИСПРАВЛЕНИЕ ДЛЯ NGINX ---
+# Заставляем Flask доверять заголовкам Nginx (X-Forwarded-For) и подставлять реальный IP в request.remote_addr
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 # --- КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ ---
 RESEND_API_KEY = os.getenv('RESEND_API_KEY')
@@ -185,7 +190,7 @@ def send_verification_code():
             print(f">>> CAPTCHA ERROR: Токен капчи отсутствует для {email}")
             return make_json_response({"message": "Капча не пройдена"}, 403)
 
-        # 2. ПРОВЕРКА КАПЧИ В CLOUDFLARE TURNSTILE
+        # 2. ПРОВЕРКА КАПЧИ В CLOUDFLARE TURNSTILE (Здесь благодаря ProxyFix поле remoteip передаст реальный IP смартфона)
         turnstile_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
         turnstile_resp = requests.post(turnstile_url, data={
             "secret": TURNSTILE_SECRET_KEY,
